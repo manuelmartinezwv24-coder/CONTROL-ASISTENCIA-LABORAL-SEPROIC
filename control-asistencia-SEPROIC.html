@@ -1,0 +1,867 @@
+<html lang="es"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Control de Asistencia Laboral – SEPROIC</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+  body{background:#0f0f0f;color:#f0ece4;font-family:'Segoe UI',sans-serif;min-height:100vh;}
+  .header{background:#1a1a1a;border-bottom:1px solid #222;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:10px;}
+  .logo{display:flex;align-items:center;gap:10px;min-width:0;}
+  .logo-icon{width:36px;height:36px;background:#f97316;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:19px;flex-shrink:0;}
+  .logo-text{font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;line-height:1.2;}
+  .logo-sub{font-size:10px;color:#f97316;font-weight:700;letter-spacing:1px;text-transform:uppercase;}
+  .pill{font-size:11px;font-weight:600;padding:4px 10px;border-radius:20px;background:#1f2a1a;color:#7bc67a;border:1px solid #2d4a2d;white-space:nowrap;flex-shrink:0;}
+  .section{padding:20px 18px 0;}
+  .date-chip{display:inline-flex;align-items:center;gap:6px;background:#1a1a1a;border:1px solid #222;border-radius:6px;padding:6px 12px;font-size:12px;color:#888;margin-bottom:18px;}
+  h1{font-size:22px;font-weight:800;line-height:1.2;margin-bottom:6px;}
+  .sub{font-size:13px;color:#666;margin-bottom:20px;}
+  .gps-bar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:8px;margin-bottom:18px;font-size:12px;}
+  .gps-ok{background:#0d1f0d;border:1px solid #1a4a1a;color:#7bc67a;}
+  .gps-err{background:#1a1200;border:1px solid #3a2800;color:#f59e0b;}
+  .gps-loading{background:#111800;border:1px solid #2a3000;color:#888;}
+  .field-label{font-size:11px;font-weight:600;color:#555;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;}
+  .selector-btn{width:100%;background:#191919;border:1.5px solid #252525;border-radius:10px;padding:14px 16px;font-size:15px;color:#444;cursor:pointer;display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;transition:border-color .2s;}
+  .selector-btn.selected{color:#f0ece4;border-color:#f97316;}
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;display:flex;align-items:flex-end;justify-content:center;}
+  .modal-sheet{background:#1a1a1a;border-radius:20px 20px 0 0;width:100%;max-width:520px;padding:0 0 30px;max-height:78vh;display:flex;flex-direction:column;}
+  .modal-header{padding:18px 18px 14px;border-bottom:1px solid #252525;display:flex;align-items:center;justify-content:space-between;}
+  .modal-title{font-size:15px;font-weight:700;}
+  .modal-close{background:none;border:none;color:#555;font-size:22px;cursor:pointer;line-height:1;}
+  .msearch{padding:12px 16px;border-bottom:1px solid #1e1e1e;}
+  .msearch input{width:100%;background:#111;border:1px solid #252525;border-radius:8px;padding:10px 14px;font-size:14px;color:#f0ece4;outline:none;font-family:inherit;}
+  .msearch input::placeholder{color:#444;}
+  .mlist{overflow-y:auto;flex:1;}
+  .mitem{padding:14px 18px;border-bottom:1px solid #1e1e1e;cursor:pointer;font-size:14px;display:flex;align-items:center;gap:12px;}
+  .mitem:active{background:#252525;}
+  .av{width:32px;height:32px;border-radius:16px;background:#252525;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#f97316;flex-shrink:0;}
+  .mempty{padding:40px;text-align:center;color:#444;font-size:13px;}
+  .obra-card{display:flex;align-items:center;gap:12px;padding:13px 14px;border-radius:10px;margin-bottom:8px;background:#191919;border:1.5px solid #252525;cursor:pointer;}
+  .obra-card.sel{background:#1c1200;border-color:#f97316;}
+  .obra-num{width:26px;height:26px;border-radius:6px;flex-shrink:0;background:#252525;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#555;}
+  .obra-card.sel .obra-num{background:#f97316;color:#000;}
+  .obra-name{font-size:13px;font-weight:500;line-height:1.3;flex:1;}
+  .chk{color:#f97316;display:none;}
+  .obra-card.sel .chk{display:block;}
+  input[type=file]{display:none;}
+  .btn-lbl{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:17px;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;user-select:none;-webkit-user-select:none;}
+  .btn-lbl.on{background:linear-gradient(135deg,#f97316,#ea580c);color:#000;box-shadow:0 4px 20px rgba(249,115,22,.35);}
+  .btn-lbl.off{background:#2a1800;color:#5a3a20;pointer-events:none;}
+  .hint{font-size:11px;color:#444;text-align:center;margin-top:8px;}
+  .btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;max-width:360px;padding:17px;border-radius:12px;border:none;font-size:15px;font-weight:700;cursor:pointer;background:linear-gradient(135deg,#f97316,#ea580c);color:#000;box-shadow:0 4px 20px rgba(249,115,22,.3);font-family:inherit;}
+  .btn-ghost{display:flex;align-items:center;justify-content:center;width:100%;max-width:360px;padding:13px;border-radius:12px;border:1.5px solid #252525;font-size:13px;font-weight:600;cursor:pointer;background:transparent;color:#777;margin-top:10px;font-family:inherit;}
+  .btn-green{background:linear-gradient(135deg,#16a34a,#15803d);box-shadow:0 4px 20px rgba(22,163,74,.3);}
+  .sc{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;padding:24px;text-align:center;}
+  .dots{display:flex;gap:6px;}
+  .dot{width:8px;height:8px;border-radius:4px;background:#f97316;animation:pulse 1.2s infinite;}
+  .dot:nth-child(2){animation-delay:.2s}.dot:nth-child(3){animation-delay:.4s}
+  @keyframes pulse{0%,100%{opacity:.2;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .fcirc{width:100px;height:100px;border-radius:50px;object-fit:cover;border:3px solid #f97316;}
+  .fcirc.v{border-color:#22c55e;width:88px;height:88px;border-radius:44px;}
+  .card{background:#141414;border:1px solid #222;border-radius:12px;padding:16px 18px;width:100%;max-width:340px;text-align:left;}
+  .rw{display:flex;justify-content:space-between;gap:12px;padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid #1e1e1e;}
+  .rw.last{border:none;padding-bottom:0;margin-bottom:0;}
+  .rl{font-size:12px;color:#555;white-space:nowrap;}
+  .rv{font-size:12px;font-weight:600;text-align:right;}
+  .fab-wrap{position:fixed;bottom:20px;right:20px;z-index:100;}
+  .fab{width:52px;height:52px;border-radius:50%;background:#1a1a1a;border:1px solid #252525;display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer;box-shadow:0 4px 20px rgba(0,0,0,.5);}
+  .badge{position:absolute;top:-4px;right:-4px;background:#f97316;color:#000;border-radius:50%;width:20px;height:20px;font-size:11px;font-weight:700;display:none;align-items:center;justify-content:center;}
+  .rc{background:#161616;border:1px solid #222;border-radius:12px;padding:14px 16px;margin-bottom:10px;display:flex;gap:12px;align-items:flex-start;}
+  .rthumb{width:50px;height:50px;border-radius:8px;object-fit:cover;border:2px solid #252525;flex-shrink:0;}
+  .rok{background:#0d2b0d;color:#22c55e;font-size:10px;font-weight:700;padding:4px 8px;border-radius:6px;border:1px solid #1a4a1a;white-space:nowrap;}
+  .empty{text-align:center;padding:60px 0;color:#444;}
+  /* ADMIN */
+  .arow{display:flex;align-items:center;gap:8px;background:#191919;border:1px solid #252525;border-radius:10px;padding:10px 12px;margin-bottom:8px;}
+  .anum{width:24px;height:24px;border-radius:6px;background:#f97316;color:#000;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;}
+  .ainp{flex:1;background:transparent;border:none;outline:none;font-size:14px;color:#f0ece4;font-family:inherit;padding:2px 0;}
+  .ainp::placeholder{color:#3a3a3a;}
+  .dbtn{background:#2a0a0a;border:1px solid #4a1a1a;color:#f87171;border-radius:6px;padding:6px 10px;font-size:13px;cursor:pointer;flex-shrink:0;font-family:inherit;}
+  .abtn{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;padding:13px;border-radius:10px;border:1.5px dashed #2a2a2a;background:transparent;color:#666;font-size:13px;cursor:pointer;margin-bottom:4px;font-family:inherit;}
+  .pinbox{width:100%;background:#191919;border:1.5px solid #252525;border-radius:10px;padding:14px;font-size:20px;color:#f0ece4;outline:none;font-family:inherit;text-align:center;letter-spacing:6px;transition:border-color .2s;}
+  .pinbox:focus{border-color:#f97316;}
+  .pierr{font-size:13px;color:#f87171;text-align:center;margin-top:8px;display:none;}
+  .divider{height:1px;background:#1e1e1e;margin:20px 0;}
+  .stitle{font-size:11px;font-weight:700;color:#666;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;}
+  /* CAJA DESCARGA */
+  .dl-box{background:#0d2b0d;border:1px solid #1a4a1a;border-radius:12px;padding:16px 18px;margin-bottom:16px;}
+  .dl-box p{font-size:13px;color:#7bc67a;margin-bottom:12px;line-height:1.5;}
+  .hidden{display:none!important;}
+  .pb{height:80px;}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<!-- HOME -->
+<div id="s-home" class="hidden">
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">🏗️</div>
+      <div><div class="logo-text">Control de Asistencia Laboral</div><div class="logo-sub">SEPROIC</div></div>
+    </div>
+    <div class="pill">● En línea</div>
+  </div>
+  <div class="section">
+    <div class="date-chip">📅 <span id="fecha-hora">lun 11 de may · 02:36 p.m.</span></div>
+    <h1>Registra tu<br>entrada al trabajo</h1>
+    <p class="sub">Selecciona tu nombre, tu obra y tómate una selfie.</p>
+    <div id="gps-bar" class="gps-bar gps-err"><span id="gps-ico">⚠️</span><span id="gps-txt">Sin GPS · se registrará sin ubicación</span></div>
+    <div class="field-label">Trabajador</div>
+    <div class="selector-btn" id="btn-sel" onclick="abrirModal()">
+      <span id="lbl-trab">Selecciona tu nombre...</span><span style="color:#555;flex-shrink:0">▼</span>
+    </div>
+    <div class="field-label">Obra / Proyecto</div>
+    <div id="obras-home"><div class="obra-card" id="oh0"><div class="obra-num">1</div><div class="obra-name">Obra 1</div><div class="chk">✓</div></div><div class="obra-card" id="oh1"><div class="obra-num">2</div><div class="obra-name">Obra 2</div><div class="chk">✓</div></div><div class="obra-card" id="oh2"><div class="obra-num">3</div><div class="obra-name">Obra 3</div><div class="chk">✓</div></div><div class="obra-card" id="oh3"><div class="obra-num">4</div><div class="obra-name">Obra 4</div><div class="chk">✓</div></div><div class="obra-card" id="oh4"><div class="obra-num">5</div><div class="obra-name">Obra 5</div><div class="chk">✓</div></div></div>
+    <div style="height:20px"></div>
+    <input type="file" id="inp" accept="image/*" capture="user" disabled="">
+    <label for="inp" class="btn-lbl off" id="btn-main">📷 &nbsp;Tomar Selfie y Registrar</label>
+    <div class="hint" id="hint-txt">Selecciona tu nombre y tu obra para continuar</div>
+    <div class="pb"></div>
+  </div>
+  <div class="fab-wrap" onclick="verHistorial()">
+    <div class="fab">📋</div><div class="badge" id="badge"></div>
+  </div>
+  <div style="position:fixed;bottom:20px;left:20px;z-index:100">
+    <div class="fab" onclick="irAdmin()" style="font-size:18px">⚙️</div>
+  </div>
+</div>
+
+<!-- MODAL TRABAJADOR -->
+<div id="modal" class="modal-overlay hidden">
+  <div class="modal-sheet">
+    <div class="modal-header">
+      <div class="modal-title">👷 Selecciona tu nombre</div>
+      <button class="modal-close" onclick="cerrarModal()">✕</button>
+    </div>
+    <div class="msearch"><input type="text" id="buscar" placeholder="Buscar nombre..." oninput="filtrar()"></div>
+    <div class="mlist" id="lista-modal"></div>
+  </div>
+</div>
+
+<!-- PROCESANDO -->
+<div id="s-proc" class="sc hidden">
+  <div style="font-size:52px;animation:spin 1.5s linear infinite">⚙️</div>
+  <div style="font-size:20px;font-weight:700">Procesando check-in...</div>
+  <img id="proc-foto" class="fcirc" src="" style="display:none">
+  <div style="font-size:13px;color:#666">Guardando foto y ubicación.</div>
+  <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+</div>
+
+<!-- ÉXITO -->
+<div id="s-exito" class="sc hidden">
+  <div style="width:72px;height:72px;border-radius:36px;background:#0d2b0d;border:2px solid #22c55e;display:flex;align-items:center;justify-content:center;font-size:32px">✅</div>
+  <div style="font-size:22px;font-weight:800">¡Check-in registrado!</div>
+  <img id="exito-foto" class="fcirc v" src="" style="display:none">
+  <div class="card">
+    <div class="rw"><span class="rl">👷 Trabajador</span><span class="rv" id="r-nom"></span></div>
+    <div class="rw"><span class="rl">🏗️ Obra</span><span class="rv" id="r-obra"></span></div>
+    <div class="rw"><span class="rl">🕐 Hora</span><span class="rv" id="r-hora"></span></div>
+    <div class="rw"><span class="rl">📅 Fecha</span><span class="rv" id="r-fecha"></span></div>
+    <div class="rw last"><span class="rl">📍 GPS</span><span class="rv" id="r-gps"></span></div>
+  </div>
+  <button class="btn" onclick="reiniciar()">Nuevo Check-in</button>
+  <button class="btn-ghost" onclick="verHistorial()">Ver registros del día</button>
+</div>
+
+<!-- HISTORIAL -->
+<div id="s-hist" class="hidden">
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">📋</div>
+      <div><div class="logo-text">Registros del día</div><div class="logo-sub">SEPROIC</div></div>
+    </div>
+    <button onclick="reiniciar()" style="background:none;border:none;color:#555;font-size:22px;cursor:pointer">✕</button>
+  </div>
+  <div style="padding:18px" id="hist-lista"></div>
+</div>
+
+<!-- PIN -->
+<div id="s-pin" class="hidden">
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">🔐</div>
+      <div><div class="logo-text">Administrador</div><div class="logo-sub">SEPROIC</div></div>
+    </div>
+    <button onclick="reiniciar()" style="background:none;border:none;color:#555;font-size:22px;cursor:pointer">✕</button>
+  </div>
+  <div class="section" style="padding-top:32px;display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center">
+    <div style="font-size:48px">🔑</div>
+    <div style="font-size:18px;font-weight:700">PIN de administrador</div>
+    <input class="pinbox" id="pin-inp" type="password" inputmode="numeric" maxlength="4" placeholder="••••">
+    <div class="pierr" id="pin-err" style="display: none;">PIN incorrecto.</div>
+    <button class="btn" style="max-width:280px" onclick="verificarPin()">Entrar</button>
+    <button class="btn-ghost" style="max-width:280px" onclick="reiniciar()">Cancelar</button>
+  </div>
+</div>
+
+<!-- ADMIN -->
+<div id="s-admin" class="hidden">
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">⚙️</div>
+      <div><div class="logo-text">Panel Admin</div><div class="logo-sub">SEPROIC</div></div>
+    </div>
+    <button onclick="reiniciar()" style="background:none;border:none;color:#555;font-size:22px;cursor:pointer">✕</button>
+  </div>
+  <div class="section" style="padding-bottom:20px">
+
+    <!-- INSTRUCCIÓN DESCARGA -->
+    <div class="dl-box">
+      <p>📥 Después de guardar, <strong>descarga el archivo actualizado</strong> y súbelo a Netlify. Así los datos quedan guardados permanentemente.</p>
+    </div>
+
+    <div class="stitle">👷 Trabajadores</div>
+    <div id="adm-trab"><div class="arow"><div class="anum">1</div><input class="ainp" type="text" value="MANUEL MARTINEZ" placeholder="Nombre del trabajador"><button class="dbtn" onclick="delTrab(0)">✕</button></div><div class="arow"><div class="anum">2</div><input class="ainp" type="text" value="LUIS VILLEDA" placeholder="Nombre del trabajador"><button class="dbtn" onclick="delTrab(1)">✕</button></div><div class="arow"><div class="anum">3</div><input class="ainp" type="text" value="HECTOR MOSCOSO" placeholder="Nombre del trabajador"><button class="dbtn" onclick="delTrab(2)">✕</button></div><div class="arow"><div class="anum">4</div><input class="ainp" type="text" value="CELESTINO" placeholder="Nombre del trabajador"><button class="dbtn" onclick="delTrab(3)">✕</button></div><div class="arow"><div class="anum">5</div><input class="ainp" type="text" value="" placeholder="Nombre del trabajador"><button class="dbtn" onclick="delTrab(4)">✕</button></div></div>
+    <button class="abtn" onclick="addTrab()">＋ Agregar trabajador</button>
+
+    <div class="divider"></div>
+
+    <div class="stitle">🏗️ Obras / Proyectos</div>
+    <div id="adm-obras"><div class="arow"><div class="anum">1</div><input class="ainp" type="text" value="Obra 1" placeholder="Nombre de la obra"><button class="dbtn" onclick="delObra(0)">✕</button></div><div class="arow"><div class="anum">2</div><input class="ainp" type="text" value="Obra 2" placeholder="Nombre de la obra"><button class="dbtn" onclick="delObra(1)">✕</button></div><div class="arow"><div class="anum">3</div><input class="ainp" type="text" value="Obra 3" placeholder="Nombre de la obra"><button class="dbtn" onclick="delObra(2)">✕</button></div><div class="arow"><div class="anum">4</div><input class="ainp" type="text" value="Obra 4" placeholder="Nombre de la obra"><button class="dbtn" onclick="delObra(3)">✕</button></div><div class="arow"><div class="anum">5</div><input class="ainp" type="text" value="Obra 5" placeholder="Nombre de la obra"><button class="dbtn" onclick="delObra(4)">✕</button></div></div>
+    <button class="abtn" onclick="addObra()">＋ Agregar obra</button>
+
+    <div class="divider"></div>
+
+    <div class="stitle">🔑 Cambiar PIN</div>
+    <input class="pinbox" id="pin-nuevo" type="password" inputmode="numeric" maxlength="4" placeholder="Nuevo PIN (4 dígitos)" style="letter-spacing:4px;font-size:16px;margin-bottom:8px">
+    <p style="font-size:11px;color:#555;margin-bottom:20px">Deja en blanco para mantener el PIN actual.</p>
+
+    <button class="btn btn-green" style="max-width:100%;margin-bottom:10px" onclick="guardarYDescargar()">
+      💾 &nbsp;Guardar y descargar archivo
+    </button>
+    <p style="font-size:11px;color:#555;text-align:center;line-height:1.6">
+      Descarga el archivo → súbelo a Netlify.<br>Los cambios quedan guardados para siempre.
+    </p>
+    <div class="pb"></div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════
+//  DATOS CONFIGURADOS — se actualizan al guardar
+// ═══════════════════════════════════════════════════
+var TRABAJADORES = [
+ 
+  "MANUEL MARTINEZ",
+  "LUIS VILLEDA",
+  "HECTOR MOSCOSO",
+  "CELESTINO",
+  "ANTHONY LOPEZ"
+
+];
+var OBRAS = [
+ 
+  "OFICINA SEPROIC",
+  "CASA CARLOS MOSCOSO",
+  "ESCUELA MARIA MOSCOSO",
+  "CHOFER CAMION",
+  "Obra 5"
+
+];
+var PIN = "2004";
+// ═══════════════════════════════════════════════════
+
+// Estado sesión
+var trabOK=null, obraOK=null, gpsOK=null, fotoUrl=null, registros=[];
+
+function ft(d){return d.toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit',hour12:true});}
+function fd(d){return d.toLocaleDateString('es-MX',{weekday:'short',day:'numeric',month:'short'});}
+document.getElementById('fecha-hora').textContent=fd(new Date())+' · '+ft(new Date());
+
+// ── OBRAS HOME ──
+function renderObrasHome(){
+  var c=document.getElementById('obras-home');
+  c.innerHTML=''; obraOK=null;
+  OBRAS.forEach(function(n,i){
+    var d=document.createElement('div');
+    d.className='obra-card'; d.id='oh'+i;
+    d.innerHTML='<div class="obra-num">'+(i+1)+'</div><div class="obra-name">'+n+'</div><div class="chk">✓</div>';
+    d.onclick=function(){selObra(i,n);};
+    c.appendChild(d);
+  });
+  actualizarBoton();
+}
+renderObrasHome();
+
+function selObra(i,n){
+  document.querySelectorAll('.obra-card').forEach(function(c){c.classList.remove('sel');});
+  document.getElementById('oh'+i).classList.add('sel');
+  obraOK={id:i+1,nombre:n};
+  actualizarBoton();
+}
+
+// ── MODAL TRABAJADOR ──
+function abrirModal(){
+  document.getElementById('buscar').value='';
+  renderModal(TRABAJADORES);
+  document.getElementById('modal').classList.remove('hidden');
+  setTimeout(function(){document.getElementById('buscar').focus();},200);
+}
+function cerrarModal(){document.getElementById('modal').classList.add('hidden');}
+function filtrar(){
+  var q=document.getElementById('buscar').value.toLowerCase();
+  renderModal(TRABAJADORES.filter(function(t){return t.toLowerCase().includes(q);}));
+}
+function renderModal(lista){
+  var c=document.getElementById('lista-modal');
+  if(!lista.length){c.innerHTML='<div class="mempty">No encontrado</div>';return;}
+  c.innerHTML=lista.map(function(t){
+    var ini=t.trim().split(/\s+/).slice(0,2).map(function(p){return p[0]||'';}).join('').toUpperCase();
+    return '<div class="mitem" onclick="selTrab(\''+t.replace(/\\/g,'\\\\').replace(/'/g,'\\\'')+'\')">'
+      +'<div class="av">'+ini+'</div><span>'+t+'</span></div>';
+  }).join('');
+}
+function selTrab(n){
+  trabOK=n;
+  document.getElementById('btn-sel').classList.add('selected');
+  document.getElementById('lbl-trab').textContent=n;
+  cerrarModal();
+  actualizarBoton();
+}
+document.getElementById('modal').addEventListener('click',function(e){if(e.target===this)cerrarModal();});
+
+// ── BOTÓN PRINCIPAL ──
+function actualizarBoton(){
+  var ok=trabOK&&obraOK;
+  document.getElementById('btn-main').className='btn-lbl '+(ok?'on':'off');
+  document.getElementById('inp').disabled=!ok;
+  document.getElementById('hint-txt').textContent=ok
+    ?'Abre la cámara del celular · GPS automático'
+    :'Selecciona tu nombre y tu obra para continuar';
+}
+
+// ── GPS ──
+function buscarGPS(){
+  if(!navigator.geolocation){setGPSerr();return;}
+  navigator.geolocation.getCurrentPosition(
+    function(p){gpsOK={lat:p.coords.latitude.toFixed(5),lon:p.coords.longitude.toFixed(5),acc:Math.round(p.coords.accuracy)};setGPSOk();},
+    function(){setGPSerr();},{timeout:10000,maximumAge:30000});
+}
+function setGPSOk(){
+  document.getElementById('gps-bar').className='gps-bar gps-ok';
+  document.getElementById('gps-ico').textContent='📍';
+  document.getElementById('gps-txt').textContent='GPS activo · ±'+gpsOK.acc+'m';
+}
+function setGPSerr(){
+  document.getElementById('gps-bar').className='gps-bar gps-err';
+  document.getElementById('gps-ico').textContent='⚠️';
+  document.getElementById('gps-txt').textContent='Sin GPS · se registrará sin ubicación';
+}
+buscarGPS();
+
+// ── FOTO ──
+document.getElementById('inp').addEventListener('change',function(e){
+  var f=e.target.files&&e.target.files[0];if(!f)return;e.target.value='';
+  var r=new FileReader();
+  r.onload=function(ev){fotoUrl=ev.target.result;procesarCheckin();};
+  r.readAsDataURL(f);
+});
+
+function procesarCheckin(){
+  pantalla('proc');
+  document.getElementById('proc-foto').src=fotoUrl;
+  document.getElementById('proc-foto').style.display='block';
+  if(!gpsOK&&navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(
+      function(p){gpsOK={lat:p.coords.latitude.toFixed(5),lon:p.coords.longitude.toFixed(5),acc:Math.round(p.coords.accuracy)};guardarReg();},
+      function(){guardarReg();},{timeout:5000});
+  } else {setTimeout(guardarReg,700);}
+}
+
+function guardarReg(){
+  var now=new Date();
+  var reg={id:Date.now(),nombre:trabOK,obra:obraOK,hora:ft(now),fecha:fd(now),gps:gpsOK,foto:fotoUrl};
+  registros.unshift(reg);actualizarBadge();
+  document.getElementById('r-nom').textContent=trabOK;
+  document.getElementById('r-obra').textContent=obraOK.nombre;
+  document.getElementById('r-hora').textContent=reg.hora;
+  document.getElementById('r-fecha').textContent=reg.fecha;
+  document.getElementById('r-gps').textContent=gpsOK?gpsOK.lat+', '+gpsOK.lon:'No disponible';
+  document.getElementById('exito-foto').src=fotoUrl;
+  document.getElementById('exito-foto').style.display='block';
+  if(gpsOK)setGPSOk();
+  pantalla('exito');
+}
+
+// ── HISTORIAL ──
+function verHistorial(){
+  var c=document.getElementById('hist-lista');
+  if(!registros.length){
+    c.innerHTML='<div class="empty"><div style="font-size:40px;margin-bottom:8px">📭</div>Sin registros aún hoy</div>';
+  } else {
+    c.innerHTML=registros.map(function(r){
+      var g=r.gps?'📍 '+r.gps.lat+', '+r.gps.lon:'⚠️ Sin GPS';
+      return '<div class="rc">'+(r.foto?'<img src="'+r.foto+'" class="rthumb">':'')
+        +'<div style="flex:1;min-width:0">'
+        +'<div style="font-size:13px;font-weight:700;margin-bottom:2px">'+r.nombre+'</div>'
+        +'<div style="font-size:12px;color:#888;margin-bottom:2px">'+r.obra.nombre+'</div>'
+        +'<div style="font-size:11px;color:#555">'+r.fecha+' · '+r.hora+'</div>'
+        +'<div style="font-size:11px;color:#555;margin-top:2px">'+g+'</div>'
+        +'</div><div class="rok">✓ OK</div></div>';
+    }).join('');
+  }
+  pantalla('hist');
+}
+
+// ── ADMIN ──
+function irAdmin(){
+  document.getElementById('pin-inp').value='';
+  document.getElementById('pin-err').style.display='none';
+  
+  pantalla('pin');
+  setTimeout(function(){document.getElementById('pin-inp').focus();},300);
+}
+function verificarPin(){
+  if(document.getElementById('pin-inp').value.trim()===PIN){abrirAdmin();}
+  else{document.getElementById('pin-err').style.display='block';document.getElementById('pin-inp').value='';}
+}
+document.getElementById('pin-inp').addEventListener('keydown',function(e){if(e.key==='Enter')verificarPin();});
+
+function abrirAdmin(){
+  renderAdmTrab();
+  renderAdmObras();
+  document.getElementById('pin-nuevo').value='';
+  pantalla('admin');
+}
+
+// ── LEER INPUTS SIN PERDER DATOS ──
+function leerTrab(){
+  var arr=[];
+  document.querySelectorAll('#adm-trab .ainp').forEach(function(i){
+    var v=i.value.trim();if(v)arr.push(v);
+  });
+  return arr;
+}
+function leerObras(){
+  var arr=[];
+  document.querySelectorAll('#adm-obras .ainp').forEach(function(i){
+    var v=i.value.trim();if(v)arr.push(v);
+  });
+  return arr;
+}
+
+function renderAdmTrab(){
+  var c=document.getElementById('adm-trab');c.innerHTML='';
+  TRABAJADORES.forEach(function(t,i){
+    var r=document.createElement('div');r.className='arow';
+    r.innerHTML='<div class="anum">'+(i+1)+'</div>'
+      +'<input class="ainp" type="text" value="'+t.replace(/"/g,'&quot;')+'" placeholder="Nombre del trabajador">'
+      +'<button class="dbtn" onclick="delTrab('+i+')">✕</button>';
+    c.appendChild(r);
+  });
+}
+function renderAdmObras(){
+  var c=document.getElementById('adm-obras');c.innerHTML='';
+  OBRAS.forEach(function(o,i){
+    var r=document.createElement('div');r.className='arow';
+    r.innerHTML='<div class="anum">'+(i+1)+'</div>'
+      +'<input class="ainp" type="text" value="'+o.replace(/"/g,'&quot;')+'" placeholder="Nombre de la obra">'
+      +'<button class="dbtn" onclick="delObra('+i+')">✕</button>';
+    c.appendChild(r);
+  });
+}
+
+function addTrab(){
+  TRABAJADORES=leerTrab();   // guarda lo escrito antes de redibujar
+  TRABAJADORES.push('');
+  renderAdmTrab();
+  var inputs=document.querySelectorAll('#adm-trab .ainp');
+  inputs[inputs.length-1].focus();
+}
+function delTrab(i){
+  TRABAJADORES=leerTrab();
+  if(TRABAJADORES.length<=1){alert('Debe haber al menos un trabajador.');return;}
+  TRABAJADORES.splice(i,1);
+  renderAdmTrab();
+}
+function addObra(){
+  OBRAS=leerObras();
+  OBRAS.push('');
+  renderAdmObras();
+  var inputs=document.querySelectorAll('#adm-obras .ainp');
+  inputs[inputs.length-1].focus();
+}
+function delObra(i){
+  OBRAS=leerObras();
+  if(OBRAS.length<=1){alert('Debe haber al menos una obra.');return;}
+  OBRAS.splice(i,1);
+  renderAdmObras();
+}
+
+// ── GUARDAR Y DESCARGAR ARCHIVO ACTUALIZADO ──
+function guardarYDescargar(){
+  var nuevosT=leerTrab().filter(function(t){return t.trim();});
+  var nuevasO=leerObras().filter(function(o){return o.trim();});
+  if(!nuevosT.length){alert('Agrega al menos un trabajador.');return;}
+  if(!nuevasO.length){alert('Agrega al menos una obra.');return;}
+
+  var pinNuevo=document.getElementById('pin-nuevo').value.trim();
+  var nuevoPin=(pinNuevo.length===4&&/^\d+$/.test(pinNuevo))?pinNuevo:PIN;
+
+  // Obtener el HTML completo de la página
+  var html=document.documentElement.outerHTML;
+
+  // Reemplazar las secciones de datos con los nuevos valores
+  var trabStr=JSON.stringify(nuevosT,null,2).replace(/^\[/,'[\n ').replace(/\]$/,'\n]');
+  var obraStr=JSON.stringify(nuevasO,null,2).replace(/^\[/,'[\n ').replace(/\]$/,'\n]');
+
+  html=html.replace(
+    /var TRABAJADORES = \[[\s\S]*?\];/,
+    'var TRABAJADORES = '+trabStr+';'
+  );
+  html=html.replace(
+    /var OBRAS = \[[\s\S]*?\];/,
+    'var OBRAS = '+obraStr+';'
+  );
+  html=html.replace(
+    /var PIN = "[^"]*";/,
+    'var PIN = "'+nuevoPin+'";'
+  );
+
+  // Resetear pantallas al estado inicial: home visible, resto oculto
+  var screens=['proc','exito','hist','pin','admin'];
+  screens.forEach(function(s){
+    // Agregar hidden a cualquier pantalla que no sea home
+    html=html.replace('id="s-'+s+'"','id="s-'+s+'" data-reset');
+  });
+  // Quitar hidden de home si lo tuviera
+  html=html.replace(/(<div id="s-home"[^>]*?)class="([^"]*?)hidden([^"]*?)"/, '$1class="$2$3"');
+  // Agregar hidden a las demás si no lo tienen
+  screens.forEach(function(s){
+    html=html.replace(
+      new RegExp('<div id="s-'+s+'" data-reset([^>]*?)class="([^"]*?)"'),
+      function(m,attrs,cls){
+        if(cls.indexOf('hidden')===-1) cls=(cls+' hidden').trim();
+        return '<div id="s-'+s+'"'+attrs+'class="'+cls+'"';
+      }
+    );
+    // Si no tenía class, agregar
+    html=html.replace(
+      '<div id="s-'+s+'" data-reset',
+      '<div id="s-'+s+'" class="hidden"'
+    );
+  });
+
+  // Descargar
+  var blob=new Blob([html],{type:'text/html;charset=utf-8'});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');
+  a.href=url;
+  a.download='control-asistencia-SEPROIC.html';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  // Actualizar en memoria
+  TRABAJADORES=nuevosT;
+  OBRAS=nuevasO;
+  PIN=nuevoPin;
+  trabOK=null;obraOK=null;
+  document.getElementById('lbl-trab').textContent='Selecciona tu nombre...';
+  document.getElementById('btn-sel').classList.remove('selected');
+  renderObrasHome();
+}
+
+// ── UTILS ──
+function reiniciar(){fotoUrl=null;pantalla('home');}
+function actualizarBadge(){
+  var b=document.getElementById('badge');
+  b.textContent=registros.length;
+  b.style.display=registros.length>0?'flex':'none';
+}
+function pantalla(n){
+  ['home','proc','exito','hist','pin','admin'].forEach(function(s){
+    document.getElementById('s-'+s).classList.toggle('hidden',s!==n);
+  });
+}
+</script>
+
+
+</body></html>
